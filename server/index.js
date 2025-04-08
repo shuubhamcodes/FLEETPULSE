@@ -1,7 +1,7 @@
 require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
-const { createClient } = require('@supabase/supabase-js');
+const { supabase, insertAlert } = require('./supabaseClient');
 
 const app = express();
 const port = process.env.PORT || 3000;
@@ -9,12 +9,6 @@ const port = process.env.PORT || 3000;
 // Middleware
 app.use(cors());
 app.use(express.json());
-
-// Initialize Supabase client
-const supabase = createClient(
-  process.env.VITE_SUPABASE_URL,
-  process.env.VITE_SUPABASE_SERVICE_ROLE_KEY
-);
 
 // Validate JWT token
 async function validateToken(authHeader) {
@@ -59,36 +53,26 @@ function validatePayload(reading) {
 
 // Check and trigger alerts
 async function checkAndTriggerAlerts(reading) {
-  const alerts = [];
-
-  if (reading.temp > 90) {
-    alerts.push({
-      vehicle_id: reading.vehicle_id,
-      type: 'temp',
-      severity: 'high',
-      message: 'High engine temperature',
-      status: 'new'
-    });
-  }
-
-  if (reading.fuel < 20) {
-    alerts.push({
-      vehicle_id: reading.vehicle_id,
-      type: 'fuel',
-      severity: 'medium',
-      message: 'Low fuel level',
-      status: 'new'
-    });
-  }
-
-  if (alerts.length > 0) {
-    const { error } = await supabase
-      .from('alerts')
-      .insert(alerts);
-
-    if (error) {
-      console.error('Error inserting alerts:', error);
+  try {
+    if (reading.temp > 90) {
+      await insertAlert(
+        reading.vehicle_id,
+        'temp',
+        'high',
+        'High engine temperature'
+      );
     }
+
+    if (reading.fuel < 20) {
+      await insertAlert(
+        reading.vehicle_id,
+        'fuel',
+        'medium',
+        'Low fuel level'
+      );
+    }
+  } catch (error) {
+    console.error('Error triggering alerts:', error);
   }
 }
 

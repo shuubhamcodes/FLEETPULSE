@@ -1,128 +1,69 @@
-require('dotenv').config();
-const express = require('express');
-const cors = require('cors');
-const { createClient } = require('@supabase/supabase-js');
+const turf = require('@turf/turf');
+const { supabase } = require('../supabaseClient');
 
-const app = express();
-const port = process.env.PORT || 3000;
-
-// Middleware
-app.use(cors());
-app.use(express.json());
-
-// Initialize Supabase client
-const supabase = createClient(
-  process.env.VITE_SUPABASE_URL,
-  process.env.VITE_SUPABASE_SERVICE_ROLE_KEY
-);
-
-// Validate JWT token
-async function validateToken(authHeader) {
-  if (!authHeader || !authHeader.startsWith('Bearer ')) {
-    throw new Error('Missing or invalid authorization header');
-  }
-
-  const token = authHeader.split(' ')[1];
-  const { data: { user }, error } = await supabase.auth.getUser(token);
-  
-  if (error || !user) {
-    throw new Error('Invalid token');
-  }
-
-  return user;
-}
-
-// Validate payload
-function validatePayload(reading) {
-  if (!reading.vehicle_id || !reading.lat || !reading.lon || 
-      reading.speed === undefined || reading.fuel === undefined || 
-      reading.temp === undefined || !reading.timestamp) {
-    throw new Error('Missing required fields');
-  }
-
-  if (reading.temp < -40 || reading.temp > 120) {
-    throw new Error('Temperature out of valid range (-40°C to 120°C)');
-  }
-
-  if (reading.fuel < 0 || reading.fuel > 100) {
-    throw new Error('Fuel must be between 0% and 100%');
-  }
-
-  if (reading.lat < -90 || reading.lat > 90 || reading.lon < -180 || reading.lon > 180) {
-    throw new Error('Invalid coordinates');
-  }
-
-  if (reading.speed < 0) {
-    throw new Error('Speed cannot be negative');
-  }
-}
-
-// Check and trigger alerts
-async function checkAndTriggerAlerts(reading) {
-  const alerts = [];
-
-  if (reading.temp > 90) {
-    alerts.push({
-      vehicle_id: reading.vehicle_id,
-      type: 'temp',
-      severity: 'high',
-      message: 'High engine temperature',
-      status: 'new'
-    });
-  }
-
-  if (reading.fuel < 20) {
-    alerts.push({
-      vehicle_id: reading.vehicle_id,
-      type: 'fuel',
-      severity: 'medium',
-      message: 'Low fuel level',
-      status: 'new'
-    });
-  }
-
-  if (alerts.length > 0) {
-    const { error } = await supabase
-      .from('alerts')
-      .insert(alerts);
-
-    if (error) {
-      console.error('Error inserting alerts:', error);
-    }
-  }
-}
-
-// Ingest vehicle route
-app.post('/api/ingest-vehicle', async (req, res) => {
+/**
+ * Check if a point is inside a polygon and create notification
+ * @param {Object} reading - Vehicle reading with lat/lon
+ * @param {Object} geofence - Geofence data with polygon and metadata
+ * @param {string} userId - User ID to notify
+ * @returns {Promise<void>}
+ */
+async function createGeofenceNotification(reading, geofence, userId) {
   try {
-    // Validate authentication
-    await validateToken(req.headers.authorization);
+    const { data: { user } } = await supabase.auth.admin.getUserById(userId);
+    if (!user) return;
 
-    // Validate payload
-    const reading = req.body;
-    validatePayload(reading);
-
-    // Insert reading
-    const { error: insertError } = await supabase
-      .from('vehicle_readings')
-      .insert([reading]);
-
-    if (insertError) {
-      throw new Error(`Error inserting reading: ${insertError.message}`);
-    }
-
-    // Check for alerts
-    await checkAndTriggerAlerts(reading);
-
-    res.json({ success: true });
-
-  } catch (error) {
-    res.status(error.message.includes('auth') ? 401 : 400).json({
-      error: error.message
+    await supabase.from('notifications').insert({
+      user_id: userId,
+      type: 'geofence',
+      message: `Vehicle ${reading.vehicle_id} has entered ${geofence.location_name}`,
+      read: false
     });
+  } catch (error) {
+    console.error('Error creating geofence notification:', error);
   }
-});
+}
 
-app.listen(port, () => {
-  console.log(`Server running on port ${port}`);
-});
+/**
+ * Check if a vehicle reading triggers any geofence alerts
+ * @param {Object} reading - Vehicle reading data
+ * @returns {Promise<void>}
+ */
+async function checkGeofences(reading) {
+  try {
+    // Get all geofences
+    const { data: geofences, error } = await supabase
+      .from('geofences')
+      .select('*');
+
+    if (error) throw error;
+
+    // Create point from reading
+    const point = turf.point([reading.lon, reading.lat]);
+
+    // Check each geofence
+    for (const geofence of geofences) {
+      const polygon = turf.polygon(geofence.geojson_polygon.coordinates);
+      const isInside = turf.booleanPointInPolygon(point, polygon);
+
+      if (isInside) {
+        // Get all users with dispatcher or admin roles
+        const { data: users } = await supabase
+          .from('user_roles')
+          .select('user_id')
+          .in('role', ['admin', 'dispatcher']);
+
+        // Create notifications for each relevant user
+        for (const user of (users || [])) {
+          await createGeofenceNotification(reading, geofence, user.user_id);
+        }
+      }
+    }
+  } catch (error) {
+    console.error('Error checking geofences:', error);
+  }
+}
+
+module.exports = {
+  checkGeofences
+};
